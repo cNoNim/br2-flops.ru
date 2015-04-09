@@ -16,7 +16,7 @@ You should download [latest daily snapshot](http://buildroot.uclibc.org/download
 Installation
 ------------
 
-Project supports building out of Buildroot tree. Everything built by Buildroot is stored in the directory `output` in the project tree. To use it you should use follow make command:
+Project supports building out of Buildroot tree. Everything built by Buildroot is stored in the directory `output` in the project tree. To use it, you can use the following make command:
 
 	make BR2_EXTERNAL=$PWD O=$PWD/output -C <path to buildroot> flops.ru_defconfig
 
