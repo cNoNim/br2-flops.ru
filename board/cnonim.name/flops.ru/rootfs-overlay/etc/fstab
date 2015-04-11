@@ -1,5 +1,5 @@
 # <file system>	<mount pt>	<type>	<options>	<dump>	<pass>
-/dev/vda2       /               ext4    rw,noauto,errors=remount-ro       0       1
+/dev/vda2       /host           ext4    rw,errors=remount-ro       0       1
 /dev/vda1       none            swap    sw                      0       0
 devpts		/dev/pts	devpts	defaults,gid=5,mode=620	0	0
 tmpfs		/dev/shm	tmpfs	mode=0777	0	0
