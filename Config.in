@@ -1,0 +1,1 @@
+source "$BR2_EXTERNAL/package/qemu-guest-agent/Config.in"
