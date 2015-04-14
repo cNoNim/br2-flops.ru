@@ -1,0 +1,442 @@
+From: Simon Zolin <address@hidden>
+
+Interfaces to execute/manage processes in the guest. Child process'
+stdin/stdout/stderr can be associated with handles for communication
+via read/write interfaces.
+
+Signed-off-by: Simon Zolin <address@hidden>
+Acked-by: Roman Kagan <address@hidden>
+Signed-off-by: Denis V. Lunev <address@hidden>
+CC: Michael Roth <address@hidden>
+---
+ qga/commands-posix.c | 297 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ qga/commands-win32.c |  21 +++-
+ qga/qapi-schema.json |  47 ++++++++
+ 3 files changed, 361 insertions(+), 4 deletions(-)
+
+diff --git a/qga/commands-posix.c b/qga/commands-posix.c
+index bf14518..d8e4ecf 100644
+--- a/qga/commands-posix.c
++++ b/qga/commands-posix.c
+@@ -505,6 +505,8 @@ static int guest_pipe_close_other_end(GuestFileHandle *gfh)
+     return 0;
+ }
+ 
++static bool guest_exec_file_busy(GuestFileHandle *gfh);
++
+ void qmp_guest_file_close(int64_t handle, Error **errp)
+ {
+     GuestFileHandle *gfh = guest_file_handle_find(handle, errp);
+@@ -520,9 +522,19 @@ void qmp_guest_file_close(int64_t handle, Error **errp)
+         return;
+     }
+ 
+-    ret = fclose(gfh->fh);
+-    if (ret == EOF) {
+-        error_setg_errno(errp, errno, "failed to close handle");
++    if (gfh->fh != NULL) {
++        ret = fclose(gfh->fh);
++        if (ret == EOF) {
++            error_setg_errno(errp, errno, "failed to close handle");
++            return;
++        }
++
++        gfh->fh = NULL;
++    }
++
++    if (guest_exec_file_busy(gfh)) {
++        error_setg_errno(errp, errno, "can't close handle %" PRId64 ", "
++                         "because it's used by guest-exec", handle);
+         return;
+     }
+ 
+@@ -842,6 +854,284 @@ static void build_fs_mount_list(FsMountList *mounts, Error **errp)
+ }
+ #endif
+ 
++typedef struct GuestExecInfo {
++    pid_t pid;
++    GuestFileHandle *gfh_stdin;
++    GuestFileHandle *gfh_stdout;
++    GuestFileHandle *gfh_stderr;
++    QTAILQ_ENTRY(GuestExecInfo) next;
++} GuestExecInfo;
++
++static struct {
++    QTAILQ_HEAD(, GuestExecInfo) processes;
++} guest_exec_state;
++
++static void guest_exec_info_add(pid_t pid,
++                                GuestFileHandle *in, GuestFileHandle *out,
++                                GuestFileHandle *error)
++{
++    GuestExecInfo *gei;
++
++    gei = g_malloc0(sizeof(*gei));
++    gei->pid = pid;
++    gei->gfh_stdin = in;
++    gei->gfh_stdout = out;
++    gei->gfh_stderr = error;
++    QTAILQ_INSERT_TAIL(&guest_exec_state.processes, gei, next);
++}
++
++static GuestExecInfo *guest_exec_info_find(pid_t pid)
++{
++    GuestExecInfo *gei;
++
++    QTAILQ_FOREACH(gei, &guest_exec_state.processes, next) {
++        if (gei->pid == pid) {
++            return gei;
++        }
++    }
++
++    return NULL;
++}
++
++/* Return TRUE if the specified file is used in guest-exec command.
++ * We must not free the memory associated with GuestFileHandle* until
++ * guest-exec-status is called. */
++static bool guest_exec_file_busy(GuestFileHandle *gfh)
++{
++    GuestExecInfo *gei;
++
++    QTAILQ_FOREACH(gei, &guest_exec_state.processes, next) {
++
++        if (gei->gfh_stdin == gfh ||
++            gei->gfh_stdout == gfh ||
++            gei->gfh_stderr == gfh) {
++
++            return true;
++        }
++    }
++
++    return false;
++}
++
++GuestExecStatus *qmp_guest_exec_status(int64_t pid, Error **err)
++{
++    GuestExecInfo *gei;
++    GuestExecStatus *ges;
++    int status, ret;
++
++    slog("guest-exec-status called, pid: %u", (uint32_t)pid);
++
++    gei = guest_exec_info_find(pid);
++    if (gei == NULL) {
++        error_set(err, QERR_INVALID_PARAMETER, "pid");
++        return NULL;
++    }
++
++    ret = waitpid(gei->pid, &status, WNOHANG);
++    if (ret == -1) {
++        error_setg_errno(err, errno, "waitpid() failed, pid: %u", gei->pid);
++        return NULL;
++    }
++
++    ges = g_malloc0(sizeof(GuestExecStatus));
++    ges->handle_stdin = gei->gfh_stdin ? gei->gfh_stdin->id : -1;
++    ges->handle_stdout = gei->gfh_stdout ? gei->gfh_stdout->id : -1;
++    ges->handle_stderr = gei->gfh_stderr ? gei->gfh_stderr->id : -1;
++    ges->exit = -1;
++    ges->signal = -1;
++
++    if (ret != 0) {
++        if (WIFEXITED(status)) {
++            ges->exit = WEXITSTATUS(status);
++
++        } else if (WIFSIGNALED(status)) {
++            ges->signal = WTERMSIG(status);
++        }
++
++        QTAILQ_REMOVE(&guest_exec_state.processes, gei, next);
++        g_free(gei);
++    }
++
++    return ges;
++}
++
++/* Get environment variables array for execve(). */
++static char **guest_exec_get_envp(const strList *env)
++{
++    const strList *it;
++    char **envp;
++    size_t i = 0, count = 1;
++
++    for (it = env; it != NULL; it = it->next) {
++        count++;
++    }
++
++    envp = g_malloc(count * sizeof(char *));
++
++    for (it = env; it != NULL; it = it->next) {
++        envp[i++] = it->value;
++    }
++
++    envp[i] = NULL;
++    return envp;
++}
++
++/* Get array of arguments for execve().
++ * @argv_str: arguments in one line separated by space. */
++static char **guest_exec_get_argv(const char *path, const strList *entry,
++                                  char **argv_str)
++{
++    const strList *it;
++    int i = 0, count = 2; /* reserve 2 for path and NULL terminator */
++    size_t argv_str_size;
++    char **argv;
++
++    argv_str_size = strlen(path) + 1;
++    for (it = entry; it != NULL; it = it->next) {
++        count++;
++        argv_str_size += sizeof(" ") - 1 + strlen(it->value);
++    }
++
++    *argv_str = g_malloc(argv_str_size);
++    pstrcpy(*argv_str, argv_str_size, path);
++
++    argv = g_malloc(count * sizeof(char *));
++    argv[i++] = (char *)path;
++
++    for (it = entry; it != NULL; it = it->next) {
++        argv[i++] = it->value;
++        pstrcat(*argv_str, argv_str_size, " ");
++        pstrcat(*argv_str, argv_str_size, it->value);
++    }
++
++    argv[i] = NULL;
++    return argv;
++}
++
++static int guest_exec_set_std(GuestFileHandle *gfh, int std_fd, int fd_null)
++{
++    int fd;
++
++    if (gfh == NULL) {
++        fd = fd_null;
++
++    } else if (gfh->pipe_other_end_fd != -1) {
++        fd = gfh->pipe_other_end_fd;
++
++    } else {
++        fd = fileno(gfh->fh);
++    }
++
++    if (dup2(fd, std_fd) == -1) {
++        slog("dup2() failed: %s", strerror(errno));
++        return 1;
++    }
++
++    return 0;
++}
++
++int64_t qmp_guest_exec(const char *path,
++                       bool has_params, strList *params,
++                       bool has_env, strList *env,
++                       bool has_handle_stdin, int64_t handle_stdin,
++                       bool has_handle_stdout, int64_t handle_stdout,
++                       bool has_handle_stderr, int64_t handle_stderr,
++                       Error **err)
++{
++    pid_t pid = -1;
++    int fd_null;
++    GuestFileHandle *gfh_stdin = NULL, *gfh_stdout = NULL, *gfh_stderr = NULL;
++    char **argv, *argv_str, **envp;
++
++    argv = guest_exec_get_argv(path, has_params ? params : NULL, &argv_str);
++
++    slog("guest-exec called: \"%s\"", argv_str);
++    g_free(argv_str);
++
++    envp = guest_exec_get_envp(has_env ? env : NULL);
++
++    if (has_handle_stdin) {
++        gfh_stdin = guest_file_handle_find(handle_stdin, err);
++        if (gfh_stdin == NULL) {
++            goto done;
++        }
++    }
++
++    if (has_handle_stdout) {
++        gfh_stdout = guest_file_handle_find(handle_stdout, err);
++        if (gfh_stdout == NULL) {
++            goto done;
++        }
++    }
++
++    if (has_handle_stderr) {
++        gfh_stderr = guest_file_handle_find(handle_stderr, err);
++        if (gfh_stderr == NULL) {
++            goto done;
++        }
++    }
++
++    pid = fork();
++    if (pid < 0) {
++        error_set(err, QERR_UNDEFINED_ERROR);
++        goto done;
++
++    } else if (pid == 0) {
++
++        setsid();
++
++        fd_null = -1;
++        if (!has_handle_stdin || !has_handle_stdout || !has_handle_stderr) {
++            fd_null = open("/dev/null", O_RDWR);
++            if (fd_null == -1) {
++                slog("guest-exec: couldn't open /dev/null: %s",
++                     strerror(errno));
++                exit(1);
++            }
++        }
++
++        if (guest_exec_set_std(gfh_stdin, STDIN_FILENO, fd_null) != 0 ||
++            guest_exec_set_std(gfh_stdout, STDOUT_FILENO, fd_null) != 0 ||
++            guest_exec_set_std(gfh_stderr, STDERR_FILENO, fd_null) != 0) {
++
++            exit(1);
++        }
++
++        if (fd_null != -1 && close(fd_null) != 0) {
++            slog("guest-exec: couldn't close /dev/null: %s", strerror(errno));
++            /* exit(1); */
++        }
++
++        execvpe(path, (char * const *)argv, (char * const *)envp);
++        slog("guest-exec child failed: %s", strerror(errno));
++        exit(1);
++    }
++
++    if (gfh_stdin != NULL && guest_pipe_close_other_end(gfh_stdin) != 0) {
++        slog("close() failed to close stdin pipe handle: %s", strerror(errno));
++    }
++
++    if (gfh_stdout != NULL && guest_pipe_close_other_end(gfh_stdout) != 0) {
++        slog("close() failed to close stdout pipe handle: %s", strerror(errno));
++    }
++
++    if (gfh_stderr != NULL && guest_pipe_close_other_end(gfh_stderr) != 0) {
++        slog("close() failed to close stderr pipe handle: %s", strerror(errno));
++    }
++
++    guest_exec_info_add(pid, gfh_stdin, gfh_stdout, gfh_stderr);
++
++done:
++    g_free(argv);
++    g_free(envp);
++    return pid;
++}
++
++static void guest_exec_init(void)
++{
++    QTAILQ_INIT(&guest_exec_state.processes);
++}
++
+ #if defined(CONFIG_FSFREEZE)
+ 
+ static char *get_pci_driver(char const *syspath, int pathlen, Error **errp)
+@@ -2096,4 +2386,5 @@ void ga_command_state_init(GAState *s, GACommandState *cs)
+     ga_command_state_add(cs, NULL, guest_fsfreeze_cleanup);
+ #endif
+     ga_command_state_add(cs, guest_file_init, NULL);
++    ga_command_state_add(cs, guest_exec_init, NULL);
+ }
+diff --git a/qga/commands-win32.c b/qga/commands-win32.c
+index 5cb7946..8fb29fc 100644
+--- a/qga/commands-win32.c
++++ b/qga/commands-win32.c
+@@ -388,6 +388,24 @@ static void guest_file_init(void)
+     QTAILQ_INIT(&guest_file_state.filehandles);
+ }
+ 
++GuestExecStatus *qmp_guest_exec_status(int64_t pid, Error **errp)
++{
++    error_set(errp, QERR_UNSUPPORTED);
++    return 0;
++}
++
++int64_t qmp_guest_exec(const char *path,
++                       bool has_params, strList *params,
++                       bool has_env, strList *env,
++                       bool has_handle_stdin, int64_t handle_stdin,
++                       bool has_handle_stdout, int64_t handle_stdout,
++                       bool has_handle_stderr, int64_t handle_stderr,
++                       Error **errp)
++{
++    error_set(errp, QERR_UNSUPPORTED);
++    return 0;
++}
++
+ GuestFilesystemInfoList *qmp_guest_get_fsinfo(Error **errp)
+ {
+     error_set(errp, QERR_UNSUPPORTED);
+@@ -689,7 +707,8 @@ GList *ga_command_blacklist_init(GList *blacklist)
+         "guest-suspend-hybrid", "guest-network-get-interfaces",
+         "guest-get-vcpus", "guest-set-vcpus",
+         "guest-fsfreeze-freeze-list", "guest-get-fsinfo",
+-        "guest-fstrim", "guest-pipe-open", NULL};
++        "guest-fstrim", "guest-pipe-open", "guest-exec-status",
++        "guest-exec", NULL};
+     char **p = (char **)list_unsupported;
+ 
+     while (*p) {
+diff --git a/qga/qapi-schema.json b/qga/qapi-schema.json
+index 67d3b72..ea09565 100644
+--- a/qga/qapi-schema.json
++++ b/qga/qapi-schema.json
+@@ -762,6 +762,53 @@
+ ##
+ { 'command': 'guest-get-fsinfo',
+   'returns': ['GuestFilesystemInfo'] }
++
++##
++# @guest-exec-status
++#
++# Check status of process associated with PID retrieved via guest-exec.
++# Reap the process and associated metadata if it has exited.
++#
++# @pid: pid returned from guest-exec
++#
++# Returns: GuestExecStatus on success.  If a child process exited, "exit" is set
++#          to the exit code.  If a child process was killed by a signal,
++#          "signal" is set to the signal number.  If a child process is still
++#          running, both "exit" and "signal" are set to -1.  On Windows,
++#          "signal" is always set to -1.
++#
++# Since: 2.3
++##
++{ 'type': 'GuestExecStatus',
++  'data': { 'exit': 'int', 'signal': 'int',
++            'handle_stdin': 'int', 'handle_stdout': 'int',
++            'handle_stderr': 'int' } }
++
++{ 'command': 'guest-exec-status',
++  'data':    { 'pid': 'int' },
++  'returns': 'GuestExecStatus' }
++
++##
++# @guest-exec:
++#
++# Execute a command in the guest
++#
++# @path: path or executable name to execute
++# @params: #optional parameter list to pass to executable
++# @env: #optional environment variables to pass to executable
++# @handle_stdin: #optional handle to associate with process' stdin.
++# @handle_stdout: #optional handle to associate with process' stdout
++# @handle_stderr: #optional handle to associate with process' stderr
++#
++# Returns: PID on success.
++#
++# Since: 2.3
++##
++{ 'command': 'guest-exec',
++  'data':    { 'path': 'str', '*params': ['str'], '*env': ['str'],
++               '*handle_stdin': 'int', '*handle_stdout': 'int',
++               '*handle_stderr': 'int' },
++  'returns': 'int' }
+ 
+ ##
+ # @guest-set-user-password
+-- 
+1.9.1

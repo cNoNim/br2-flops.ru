@@ -1,0 +1,69 @@
+From: Simon Zolin <address@hidden>
+
+If write operation fails on a pipe whose reading end is closed, qemu-ga
+won't be terminated, but instead write() will fail with error EPIPE.
+
+execve() inherits signals that are ignored, so reset SIGPIPE to its default
+handler before calling execve() in a forked process.
+
+Signed-off-by: Simon Zolin <address@hidden>
+Signed-off-by: Denis V. Lunev <address@hidden>
+CC: Michael Roth <address@hidden>
+---
+ qga/commands-posix.c | 16 ++++++++++++++++
+ qga/main.c           |  6 ++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/qga/commands-posix.c b/qga/commands-posix.c
+index d8e4ecf..bf9f79f 100644
+--- a/qga/commands-posix.c
++++ b/qga/commands-posix.c
+@@ -1030,6 +1030,20 @@ static int guest_exec_set_std(GuestFileHandle *gfh, int std_fd, int fd_null)
+     return 0;
+ }
+ 
++/** Reset ignored signals back to default. */
++static void guest_exec_reset_child_sig(void)
++{
++    struct sigaction sigact;
++
++    memset(&sigact, 0, sizeof(struct sigaction));
++    sigact.sa_handler = SIG_DFL;
++
++    if (sigaction(SIGPIPE, &sigact, NULL) != 0) {
++        slog("sigaction() failed to reset child process's SIGPIPE: %s",
++             strerror(errno));
++    }
++}
++
+ int64_t qmp_guest_exec(const char *path,
+                        bool has_params, strList *params,
+                        bool has_env, strList *env,
+@@ -1102,6 +1116,8 @@ int64_t qmp_guest_exec(const char *path,
+             /* exit(1); */
+         }
+ 
++        guest_exec_reset_child_sig();
++
+         execvpe(path, (char * const *)argv, (char * const *)envp);
+         slog("guest-exec child failed: %s", strerror(errno));
+         exit(1);
+diff --git a/qga/main.c b/qga/main.c
+index 9939a2b..bc6414c 100644
+--- a/qga/main.c
++++ b/qga/main.c
+@@ -160,6 +160,12 @@ static gboolean register_signal_handlers(void)
+         g_error("error configuring signal handler: %s", strerror(errno));
+     }
+ 
++    sigact.sa_handler = SIG_IGN;
++    if (sigaction(SIGPIPE, &sigact, NULL) != 0) {
++        g_error("error configuring SIGPIPE signal handler: %s",
++                strerror(errno));
++    }
++
+     return true;
+ }
+ 
+-- 
+1.9.1

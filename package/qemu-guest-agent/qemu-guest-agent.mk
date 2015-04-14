@@ -4,7 +4,7 @@
 #
 ################################################################################
 
-QEMU_GUEST_AGENT_VERSION = 2.2.0
+QEMU_GUEST_AGENT_VERSION = 2.3.0-rc3
 QEMU_GUEST_AGENT_SOURCE = qemu-$(QEMU_GUEST_AGENT_VERSION).tar.bz2
 QEMU_GUEST_AGENT_SITE = http://wiki.qemu.org/download
 QEMU_GUEST_AGENT_LICENSE = GPLv2 LGPLv2.1 MIT BSD-3c BSD-2c Others/BSD-1c
@@ -69,8 +69,13 @@ define QEMU_GUEST_AGENT_BUILD_CMDS
 	$(TARGET_MAKE_ENV) $(MAKE) -C $(@D) qemu-ga
 endef
 
+define QEMU_GUEST_AGENT_INSTALL_INIT_SYSV
+	$(INSTALL) -D -m 0755 $(BR2_EXTERNAL)/package/qemu-guest-agent/S99qemu-ga \
+		$(TARGET_DIR)/etc/init.d/S99qemu-ga
+endef
+
 define QEMU_GUEST_AGENT_INSTALL_TARGET_CMDS
-	$(TARGET_MAKE_ENV) $(MAKE) -C $(@D) $(QEMU_GUEST_AGENT_MAKE_ENV) DESTDIR=$(TARGET_DIR) install
+	$(INSTALL) -D -m 0755 $(@D)/qemu-ga $(TARGET_DIR)/usr/sbin/qemu-ga
 endef
 
 $(eval $(generic-package))

@@ -1,0 +1,213 @@
+From: Simon Zolin <address@hidden>
+
+Creates a FIFO pair that can be used with existing file read/write
+interfaces to communicate with processes spawned via the forthcoming
+guest-file-exec interface.
+
+Signed-off-by: Simon Zolin <address@hidden>
+Acked-by: Roman Kagan <address@hidden>
+Signed-off-by: Denis V. Lunev <address@hidden>
+CC: Michael Roth <address@hidden>
+---
+ qga/commands-posix.c | 82 ++++++++++++++++++++++++++++++++++++++++++++++++++--
+ qga/commands-win32.c |  8 ++++-
+ qga/qapi-schema.json | 21 ++++++++++++++
+ 3 files changed, 108 insertions(+), 3 deletions(-)
+
+diff --git a/qga/commands-posix.c b/qga/commands-posix.c
+index fd746db..bf14518 100644
+--- a/qga/commands-posix.c
++++ b/qga/commands-posix.c
+@@ -208,9 +208,11 @@ void qmp_guest_set_time(bool has_time, int64_t time_ns, Error **errp)
+     }
+ }
+ 
++
+ typedef struct GuestFileHandle {
+     uint64_t id;
+     FILE *fh;
++    int pipe_other_end_fd; /* if set, it's a pipe fd of the other end. */
+     QTAILQ_ENTRY(GuestFileHandle) next;
+ } GuestFileHandle;
+ 
+@@ -218,7 +220,8 @@ static struct {
+     QTAILQ_HEAD(, GuestFileHandle) filehandles;
+ } guest_file_state;
+ 
+-static int64_t guest_file_handle_add(FILE *fh, Error **errp)
++static int64_t guest_file_handle_add(FILE *fh, int pipe_other_end_fd,
++                                     Error **errp)
+ {
+     GuestFileHandle *gfh;
+     int64_t handle;
+@@ -231,6 +234,7 @@ static int64_t guest_file_handle_add(FILE *fh, Error **errp)
+     gfh = g_malloc0(sizeof(GuestFileHandle));
+     gfh->id = handle;
+     gfh->fh = fh;
++    gfh->pipe_other_end_fd = pipe_other_end_fd;
+     QTAILQ_INSERT_TAIL(&guest_file_state.filehandles, gfh, next);
+ 
+     return handle;
+@@ -422,7 +426,7 @@ int64_t qmp_guest_file_open(const char *path, bool has_mode, const char *mode,
+         return -1;
+     }
+ 
+-    handle = guest_file_handle_add(fh, errp);
++    handle = guest_file_handle_add(fh, -1, errp);
+     if (handle < 0) {
+         fclose(fh);
+         return -1;
+@@ -432,6 +436,75 @@ int64_t qmp_guest_file_open(const char *path, bool has_mode, const char *mode,
+     return handle;
+ }
+ 
++int64_t qmp_guest_pipe_open(const char *mode, Error **err)
++{
++    FILE *f = NULL;
++    int fd[2], this_end, other_end;
++    int64_t handle;
++
++    slog("guest-pipe-open called");
++
++    if ((mode[0] != 'r' && mode[0] != 'w') || mode[1] != '\0') {
++        error_set(err, ERROR_CLASS_GENERIC_ERROR,
++                  "Only \"r\" or \"w\" are the valid modes to open a pipe");
++        return -1;
++    }
++
++    if (pipe(fd) != 0) {
++        error_set_errno(err, errno, QERR_QGA_COMMAND_FAILED, "pipe() failed");
++        return -1;
++    }
++
++    this_end = (mode[0] == 'w');
++    other_end = !this_end;
++
++    if (guest_file_toggle_flags(fd[this_end], O_NONBLOCK, true, err) == -1) {
++        goto fail;
++    }
++
++    qemu_set_cloexec(fd[this_end]);
++    qemu_set_cloexec(fd[other_end]);
++
++    f = fdopen(fd[this_end], mode);
++    if (f == NULL) {
++        error_set_errno(err, errno, QERR_QGA_COMMAND_FAILED,
++                        "fdopen() failed to open pipe handle");
++        goto fail;
++    }
++
++    handle = guest_file_handle_add(f, fd[other_end], err);
++    if (handle == -1) {
++        goto fail;
++    }
++
++    slog("guest-pipe-open: handle: %" PRId64, handle);
++
++    return handle;
++
++fail:
++    if (f != NULL) {
++        fclose(f);
++    } else {
++        close(fd[this_end]);
++    }
++    close(fd[other_end]);
++
++    return -1;
++}
++
++static int guest_pipe_close_other_end(GuestFileHandle *gfh)
++{
++    if (gfh->pipe_other_end_fd != -1) {
++        if (close(gfh->pipe_other_end_fd) != 0) {
++            return 1;
++        }
++
++        gfh->pipe_other_end_fd = -1;
++    }
++
++    return 0;
++}
++
+ void qmp_guest_file_close(int64_t handle, Error **errp)
+ {
+     GuestFileHandle *gfh = guest_file_handle_find(handle, errp);
+@@ -442,6 +515,11 @@ void qmp_guest_file_close(int64_t handle, Error **errp)
+         return;
+     }
+ 
++    if (guest_pipe_close_other_end(gfh) != 0) {
++        error_setg_errno(errp, errno, "failed to close pipe handle");
++        return;
++    }
++
+     ret = fclose(gfh->fh);
+     if (ret == EOF) {
+         error_setg_errno(errp, errno, "failed to close handle");
+diff --git a/qga/commands-win32.c b/qga/commands-win32.c
+index 5db96ef..5cb7946 100644
+--- a/qga/commands-win32.c
++++ b/qga/commands-win32.c
+@@ -154,6 +154,12 @@ int64_t qmp_guest_file_open(const char *path, bool has_mode,
+     return fd;
+ }
+ 
++int64_t qmp_guest_pipe_open(const char *mode, Error **errp)
++{
++    error_set(errp, QERR_UNSUPPORTED);
++    return 0;
++}
++
+ void qmp_guest_file_close(int64_t handle, Error **errp)
+ {
+     bool ret;
+@@ -683,7 +689,7 @@ GList *ga_command_blacklist_init(GList *blacklist)
+         "guest-suspend-hybrid", "guest-network-get-interfaces",
+         "guest-get-vcpus", "guest-set-vcpus",
+         "guest-fsfreeze-freeze-list", "guest-get-fsinfo",
+-        "guest-fstrim", NULL};
++        "guest-fstrim", "guest-pipe-open", NULL};
+     char **p = (char **)list_unsupported;
+ 
+     while (*p) {
+diff --git a/qga/qapi-schema.json b/qga/qapi-schema.json
+index 376e79f..67d3b72 100644
+--- a/qga/qapi-schema.json
++++ b/qga/qapi-schema.json
+@@ -212,12 +212,33 @@
+   'returns': 'int' }
+ 
+ ##
++# @guest-pipe-open
++#
++# Open a pipe to in the guest to associated with a qga-spawned processes
++# for communication.
++#
++# Returns: Guest file handle on success, as per guest-file-open. This
++# handle is useable with the same interfaces as a handle returned by
++# guest-file-open.
++#
++# Since: 2.3
++##
++{ 'command': 'guest-pipe-open',
++  'data':    { 'mode': 'str' },
++  'returns': 'int' }
++
++##
+ # @guest-file-close:
+ #
+ # Close an open file in the guest
+ #
+ # @handle: filehandle returned by guest-file-open
+ #
++# Please note that closing the write side of a pipe will block until the read
++# side is closed.  If you passed the read-side of the pipe to a qga-spawned
++# process, make sure the process has exited before attempting to close the
++# write side.
++#
+ # Returns: Nothing on success.
+ #
+ # Since: 0.15.0
+-- 
+1.9.1

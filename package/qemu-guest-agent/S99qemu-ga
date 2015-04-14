@@ -1,0 +1,45 @@
+#!/bin/sh
+#
+# Starts QEMU guest agent.
+#
+
+[ -r /etc/default/qemu-ga ] && . /etc/default/qemu-ga
+
+DESC="QEMU guest agent"
+
+start() {
+	GA_METHOD=${GA_METHOD:-virtio-serial}
+    GA_PATH=${GA_PATH:-/dev/vport2p1}
+
+	echo -n "Starting ${DESC}: "
+	start-stop-daemon -S -q -p /var/run/qemu-ga.pid \
+		--exec /usr/sbin/qemu-ga -- -m ${GA_METHOD} -p ${GA_PATH} \
+		-l /dev/null -d -f /var/run/qemu-ga.pid -t /var/run ${GA_OPTIONS}
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+}
+stop() {
+	echo -n "Stopping $DESC: "
+	start-stop-daemon --stop --pidfile /var/run/qemu-ga.pid
+	[ $? = 0 ] && echo "OK" || echo "FAIL"
+}
+restart() {
+	stop
+	start
+}
+
+case "$1" in
+	start)
+		start
+	;;
+	stop)
+		stop
+	;;
+	restart|reload)
+		restart
+	;;
+	*)
+	echo "Usage: $0 {start|stop|status|restart}"
+	exit 1
+esac
+
+exit $?
