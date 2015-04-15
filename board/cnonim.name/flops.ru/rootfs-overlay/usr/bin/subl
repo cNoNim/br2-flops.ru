@@ -227,7 +227,7 @@ handle_connection () {
     local token
     local tmp
 
-    while read 0<&3; do
+    while read 0<&4; do
         REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"
         REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"
 
@@ -236,7 +236,7 @@ handle_connection () {
         token=""
         tmp=""
 
-        while read 0<&3; do
+        while read 0<&4; do
             REPLY="${REPLY#"${REPLY%%[![:space:]]*}"}"
             REPLY="${REPLY%"${REPLY##*[![:space:]]}"}"
 
@@ -258,7 +258,7 @@ handle_connection () {
                         touch "$tmp"
                     fi
 
-                    dd bs=1 count=$value <&3 >>"$tmp" 2>/dev/null
+                    dd bs=1 count=$value <&4 >>"$tmp" 2>/dev/null
                     ;;
                 *)
                     ;;
@@ -281,14 +281,19 @@ handle_connection () {
 
 # connect to textmate and send command
 #
-exec 3<> /dev/tcp/$host/$port
+fifodir=$(mktemp -d)
+mkfifo $fifodir/in $fifodir/out
+nc $host $port <$fifodir/in >$fifodir/out &
+exec 3>$fifodir/in 4<$fifodir/out
+rm -rf $fifodir
+
 
 if [ $? -gt 0 ]; then
     echo "Unable to connect to TextMate on $host:$port"
     exit 1
 fi
 
-read server_info 0<&3
+read server_info 0<&4
 
 log $server_info
 
